@@ -1,125 +1,226 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-炉 (Lu) — lu_patch.py
-核心强制规则第一版：唯一性锚点校验 + 自动可回滚快照
-"""
+lu_patch.py -- 炉的写入编排器
 
-import sys
+设计原则:
+1. 唯一性校验等所有判断类规则,全部以独立子进程运行,
+   只允许读 target/old/new,不给写权限,校验节点没有能力绕过自己去写文件。
+2. 加新规则 = 在 rules/ 下新增一个文件夹(node.json + entry),
+   不需要改这个文件本身。
+3. 真正的写入动作,只在这一个文件里发生,且只在所有规则都通过之后发生。
+4. 写入用原子写(tmp + os.replace + flock 目标文件),不用裸 open/write。
+"""
 import argparse
-import pathlib
-import datetime
+import json
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import time
+import fcntl
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RULES_DIR = os.path.join(BASE_DIR, "rules")
+SNAPSHOT_DIR = os.path.join(BASE_DIR, "snapshots")
 
 
-def find_snapshot_dir(target: pathlib.Path) -> pathlib.Path:
-    lu_home = pathlib.Path.home() / "lu"
-    snap_dir = lu_home / "snapshots"
-    snap_dir.mkdir(parents=True, exist_ok=True)
-    return snap_dir
+# ==================== 规则加载与执行 ====================
+
+def load_rules():
+    """扫描 rules/ 目录，按文件夹名排序（保证执行顺序稳定）。"""
+    rules = []
+    if not os.path.isdir(RULES_DIR):
+        return rules
+    for name in sorted(os.listdir(RULES_DIR)):
+        rule_dir = os.path.join(RULES_DIR, name)
+        node_file = os.path.join(rule_dir, "node.json")
+        if not os.path.isdir(rule_dir) or not os.path.exists(node_file):
+            continue
+        with open(node_file, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        meta["_dir"] = rule_dir
+        rules.append(meta)
+    return rules
 
 
-def make_snapshot(target: pathlib.Path, original_text: str) -> pathlib.Path:
-    snap_dir = find_snapshot_dir(target)
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    safe_name = target.name.replace("/", "_")
-    snap_path = snap_dir / f"{safe_name}.{ts}.bak"
-    snap_path.write_text(original_text, encoding="utf-8")
-    return snap_path
+def run_rules(target, old_file, new_file):
+    """
+    依次运行所有规则节点（各自独立子进程）。
+    任意一条不通过就立即停止，返回失败的规则名和输出。
+    全部通过返回 True。
+    """
+    for rule in load_rules():
+        entry = os.path.join(rule["_dir"], rule.get("entry", "check.py"))
+        if not os.path.exists(entry):
+            print(f"警告：规则 {rule.get('name')} 的入口文件不存在，跳过")
+            continue
+        result = subprocess.run(
+            ["python3", entry, "--target", target, "--old", old_file, "--new", new_file],
+            capture_output=True, text=True
+        )
+        print(f"[规则] {rule.get('name', rule['_dir'])}")
+        if result.stdout.strip():
+            print(result.stdout.strip())
+        if result.returncode != 0:
+            if result.stderr.strip():
+                print(result.stderr.strip())
+            return False, rule.get("name", rule["_dir"]), result.stdout
+    return True, None, None
 
 
-def find_latest_snapshot(target: pathlib.Path):
-    snap_dir = find_snapshot_dir(target)
-    safe_name = target.name.replace("/", "_")
-    candidates = sorted(snap_dir.glob(f"{safe_name}.*.bak"))
+# ==================== 原子写入 / 快照 / 锁 ====================
+
+def snapshot(path):
+    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
+    name = os.path.basename(path)
+    dest = os.path.join(SNAPSHOT_DIR, f"{name}.{ts}.bak")
+    shutil.copy2(path, dest)
+    return dest
+
+
+def find_latest_snapshot(path):
+    name = os.path.basename(path)
+    if not os.path.isdir(SNAPSHOT_DIR):
+        return None
+    candidates = [f for f in os.listdir(SNAPSHOT_DIR) if f.startswith(name + ".")]
     if not candidates:
         return None
-    return candidates[-1]
+    candidates.sort()
+    return os.path.join(SNAPSHOT_DIR, candidates[-1])
 
 
-def do_rollback(target: pathlib.Path) -> int:
-    if not target.exists():
-        print(f"[参数错误] 目标文件不存在，无法确定要回滚哪个文件: {target}")
-        return 3
-    latest = find_latest_snapshot(target)
-    if latest is None:
-        print(f"[未找到] 没有找到 {target.name} 对应的任何快照，无法回滚。")
-        return 1
-    backup_text = latest.read_text(encoding="utf-8")
-    target.write_text(backup_text, encoding="utf-8")
-    print(f"[成功] 已用快照恢复 {target}")
-    print(f"[来源] 恢复自 {latest}")
-    return 0
+def unlock_if_needed(path):
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    if not (mode & stat.S_IWUSR):
+        os.chmod(path, 0o644)
+        return mode
+    return None
 
 
-def show_context(text: str, needle: str, max_hits: int = 5) -> None:
-    count = text.count(needle)
-    if count == 0:
-        print("[未找到] 目标文件中不存在这段原文，请确认是否逐字复制、有无多余空格或换行差异。")
+def relock(path, original_mode):
+    if original_mode is not None:
+        os.chmod(path, original_mode)
+
+
+def atomic_write(path, new_content):
+    """
+    原子写入：tmp 文件 + os.replace，flock 锁目标文件本身（不是锁 tmp）。
+    移植自 zhongqu 内核 v2.4 的修复经验。
+    """
+    tmp = path + ".tmp." + str(os.getpid())
+    try:
+        with open(path, "a", encoding="utf-8") as lock_f:
+            fcntl.flock(lock_f, fcntl.LOCK_EX)
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(new_content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        return True
+    except Exception as e:
+        print(f"原子写入失败：{e}")
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return False
+
+
+# ==================== 对外命令 ====================
+
+def do_replace(path, old_file, new_file):
+    if not os.path.exists(path):
+        print(f"错误：目标文件不存在 {path}")
+        sys.exit(1)
+
+    ok, failed_rule, _ = run_rules(path, old_file, new_file)
+    if not ok:
+        print(f"拒绝写入：规则「{failed_rule}」未通过")
+        sys.exit(2)
+
+    with open(old_file, "r", encoding="utf-8") as f:
+        old_text = f.read()
+    with open(new_file, "r", encoding="utf-8") as f:
+        new_text = f.read()
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    snap_path = snapshot(path)
+    original_mode = unlock_if_needed(path)
+    try:
+        new_content = content.replace(old_text, new_text)
+        success = atomic_write(path, new_content)
+    finally:
+        relock(path, original_mode)
+
+    if success:
+        print(f"写入成功。快照: {snap_path}")
+    else:
+        sys.exit(1)
+
+
+def do_rollback(path):
+    snap = find_latest_snapshot(path)
+    if not snap:
+        print(f"错误：找不到 {path} 的快照")
+        sys.exit(1)
+    original_mode = unlock_if_needed(path)
+    try:
+        with open(snap, "r", encoding="utf-8") as f:
+            snap_content = f.read()
+        atomic_write(path, snap_content)
+    finally:
+        relock(path, original_mode)
+    print(f"已回滚: {path} <- {snap}")
+
+
+def do_lock(path):
+    os.chmod(path, 0o444)
+    print(f"已锁定（只读）: {path}")
+
+
+def do_unlock(path):
+    os.chmod(path, 0o644)
+    print(f"已解锁（可写，仅供调试用，正常操作不要用）: {path}")
+
+
+def do_list_rules():
+    rules = load_rules()
+    if not rules:
+        print("当前没有任何规则节点")
         return
-    print(f"[不唯一] 目标文件中这段原文共出现 {count} 次，以下是各处位置附近的上下文：")
-    start = 0
-    hit_no = 0
-    while True:
-        idx = text.find(needle, start)
-        if idx == -1 or hit_no >= max_hits:
-            break
-        hit_no += 1
-        ctx_start = max(0, idx - 40)
-        ctx_end = min(len(text), idx + len(needle) + 40)
-        snippet = text[ctx_start:ctx_end].replace("\n", "\\n")
-        print(f"  第{hit_no}处（字符位置{idx}附近）: ...{snippet}...")
-        start = idx + 1
-    if count > max_hits:
-        print(f"  （还有 {count - max_hits} 处未列出）")
-    print("请调整 --old-file 的内容，加入更多上下文使其唯一匹配，或改用别的锚点。")
+    for r in rules:
+        print(f"- {r.get('name')}：{r.get('desc', '')}")
+        if r.get("对应真实坑"):
+            print(f"  对应真实坑：{r['对应真实坑']}")
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="炉 — 唯一性锚点校验 + 自动快照的安全文件替换工具"
-    )
-    parser.add_argument("target", help="要修改的目标文件路径")
-    parser.add_argument("--rollback", action="store_true", help="回滚模式")
-    parser.add_argument("--old-file", help="包含原文的纯文本文件路径")
-    parser.add_argument("--new-file", help="包含替换后新文本的纯文本文件路径")
-    parser.add_argument("--count", type=int, default=1, help="期望原文出现的次数，默认1")
+def main():
+    parser = argparse.ArgumentParser(description="lu_patch - 炉的写入编排器")
+    parser.add_argument("target", nargs="?")
+    parser.add_argument("--old-file")
+    parser.add_argument("--new-file")
+    parser.add_argument("--rollback", action="store_true")
+    parser.add_argument("--lock", action="store_true")
+    parser.add_argument("--unlock", action="store_true")
+    parser.add_argument("--list-rules", action="store_true")
     args = parser.parse_args()
 
-    target = pathlib.Path(args.target)
-
-    if args.rollback:
-        return do_rollback(target)
-
-    if not args.old_file or not args.new_file:
-        print("[参数错误] 写入模式必须同时提供 --old-file 和 --new-file，或改用 --rollback。")
-        return 3
-
-    old_file = pathlib.Path(args.old_file)
-    new_file = pathlib.Path(args.new_file)
-
-    for p, label in [(target, "目标文件"), (old_file, "--old-file"), (new_file, "--new-file")]:
-        if not p.exists():
-            print(f"[参数错误] {label} 不存在: {p}")
-            return 3
-
-    original_text = target.read_text(encoding="utf-8")
-    old_text = old_file.read_text(encoding="utf-8")
-    new_text = new_file.read_text(encoding="utf-8")
-
-    occurrences = original_text.count(old_text)
-
-    if occurrences != args.count:
-        show_context(original_text, old_text)
-        return 1 if occurrences == 0 else 2
-
-    snap_path = make_snapshot(target, original_text)
-    updated_text = original_text.replace(old_text, new_text, args.count)
-    target.write_text(updated_text, encoding="utf-8")
-
-    print(f"[成功] 已写入 {target}")
-    print(f"[快照] 原文件已备份至 {snap_path}")
-    print(f"如需回滚，运行：python3 core/lu_patch.py {target} --rollback")
-    return 0
+    if args.list_rules:
+        do_list_rules()
+    elif args.rollback:
+        do_rollback(args.target)
+    elif args.lock:
+        do_lock(args.target)
+    elif args.unlock:
+        do_unlock(args.target)
+    elif args.old_file and args.new_file:
+        do_replace(args.target, args.old_file, args.new_file)
+    else:
+        print("错误：需要 --old-file/--new-file，或 --rollback，或 --lock/--unlock，或 --list-rules")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

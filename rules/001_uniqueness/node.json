@@ -1,0 +1,6 @@
+{
+  "name": "唯一性校验",
+  "entry": "check.py",
+  "desc": "校验 old 内容在 target 文件中唯一出现，不满足则拒绝写入",
+  "对应真实坑": "无界/灵体项目里手写 assert text.count(old)==1，容易漏写导致误覆盖"
+}

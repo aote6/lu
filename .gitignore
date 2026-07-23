@@ -1,5 +1,5 @@
-__pycache__/
-*.pyc
+*.bak
+*.bak.*
 snapshots/
-logs/
+__pycache__/
 .patches/
