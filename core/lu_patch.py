@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 import fcntl
+import op_log
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RULES_DIR = os.path.join(BASE_DIR, "rules")
@@ -137,6 +138,7 @@ def do_replace(path, old_file, new_file):
     ok, failed_rule, _ = run_rules(path, old_file, new_file)
     if not ok:
         print(f"拒绝写入：规则「{failed_rule}」未通过")
+        op_log.log_op("replace", path, "failed", detail=f"规则未通过：{failed_rule}")
         sys.exit(2)
 
     with open(old_file, "r", encoding="utf-8") as f:
@@ -156,7 +158,9 @@ def do_replace(path, old_file, new_file):
 
     if success:
         print(f"写入成功。快照: {snap_path}")
+        op_log.log_op("replace", path, "success", detail=f"快照：{snap_path}")
     else:
+        op_log.log_op("replace", path, "failed", detail="原子写入失败")
         sys.exit(1)
 
 
@@ -164,6 +168,7 @@ def do_rollback(path):
     snap = find_latest_snapshot(path)
     if not snap:
         print(f"错误：找不到 {path} 的快照")
+        op_log.log_op("rollback", path, "failed", detail="找不到快照")
         sys.exit(1)
     original_mode = unlock_if_needed(path)
     try:
@@ -173,6 +178,7 @@ def do_rollback(path):
     finally:
         relock(path, original_mode)
     print(f"已回滚: {path} <- {snap}")
+    op_log.log_op("rollback", path, "success", detail=f"来自快照：{snap}")
 
 
 def do_lock(path):
