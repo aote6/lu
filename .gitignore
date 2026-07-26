@@ -3,4 +3,4 @@
 snapshots/
 __pycache__/
 .patches/
-logs/
+patch_*.txt
