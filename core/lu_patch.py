@@ -181,6 +181,99 @@ def do_rollback(path):
     op_log.log_op("rollback", path, "success", detail=f"来自快照：{snap}")
 
 
+def resolve_new_text(text_arg, new_file_arg):
+    if text_arg is not None:
+        return text_arg
+    if new_file_arg:
+        with open(new_file_arg, "r", encoding="utf-8") as f:
+            return f.read()
+    print("错误：需要提供 --text 或 --new-file")
+    sys.exit(1)
+
+
+def do_line_replace(path, start, end, new_text):
+    if not os.path.exists(path):
+        print(f"错误：目标文件不存在 {path}")
+        sys.exit(1)
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    if start < 1 or end < start or end > len(lines):
+        print(f"错误：行号范围不合法（文件共 {len(lines)} 行，请求 {start}-{end}）")
+        sys.exit(1)
+
+    print(f"[将被替换的行 {start}-{end}]")
+    print("".join(lines[start-1:end]).rstrip("\n"))
+
+    if not new_text.endswith("\n"):
+        new_text += "\n"
+
+    snap_path = snapshot(path)
+    original_mode = unlock_if_needed(path)
+    try:
+        new_content = "".join(lines[:start-1]) + new_text + "".join(lines[end:])
+        success = atomic_write(path, new_content)
+    finally:
+        relock(path, original_mode)
+    if success and path.endswith(".py"):
+        import py_compile
+        try:
+            py_compile.compile(path, doraise=True)
+        except py_compile.PyCompileError as e:
+            print(f"语法校验失败，自动回滚: {e}")
+            # 恢复到快照
+            if snap_path and os.path.exists(snap_path):
+                original_mode2 = unlock_if_needed(path)
+                try:
+                    with open(snap_path, "r", encoding="utf-8") as f:
+                        snap_content = f.read()
+                    atomic_write(path, snap_content)
+                finally:
+                    relock(path, original_mode2)
+            op_log.log_op("line_replace", path, "failed", detail=f"语法校验失败，已自动回滚: {e}")
+            sys.exit(1)
+    if success:
+        print(f"写入成功（行 {start}-{end}）。快照: {snap_path}")
+        op_log.log_op("line_replace", path, "success", detail=f"行{start}-{end}，快照：{snap_path}")
+    else:
+        op_log.log_op("line_replace", path, "failed", detail=f"行{start}-{end} 原子写入失败")
+        sys.exit(1)
+
+
+def do_whole_file(path, new_text):
+    if not os.path.exists(path):
+        print(f"错误：目标文件不存在 {path}")
+        sys.exit(1)
+
+    snap_path = snapshot(path)
+    original_mode = unlock_if_needed(path)
+    try:
+        success = atomic_write(path, new_text)
+    finally:
+        relock(path, original_mode)
+    if success and path.endswith(".py"):
+        import py_compile
+        try:
+            py_compile.compile(path, doraise=True)
+        except py_compile.PyCompileError as e:
+            print(f"语法校验失败，自动回滚: {e}")
+            if snap_path and os.path.exists(snap_path):
+                original_mode2 = unlock_if_needed(path)
+                try:
+                    with open(snap_path, "r", encoding="utf-8") as f:
+                        snap_content = f.read()
+                    atomic_write(path, snap_content)
+                finally:
+                    relock(path, original_mode2)
+            op_log.log_op("whole_file", path, "failed", detail=f"语法校验失败，已自动回滚: {e}")
+            sys.exit(1)
+    if success:
+        print(f"整文件替换成功（已跳过唯一性校验）。快照: {snap_path}")
+        op_log.log_op("whole_file", path, "success", detail=f"跳过规则校验，快照：{snap_path}")
+    else:
+        op_log.log_op("whole_file", path, "failed", detail="原子写入失败")
+        sys.exit(1)
+
+
 def do_lock(path):
     os.chmod(path, 0o444)
     print(f"已锁定（只读）: {path}")
@@ -211,6 +304,10 @@ def main():
     parser.add_argument("--lock", action="store_true")
     parser.add_argument("--unlock", action="store_true")
     parser.add_argument("--list-rules", action="store_true")
+    parser.add_argument("--line", type=int, help="替换指定行号，配合 --text 或 --new-file")
+    parser.add_argument("--range", help="替换行号范围，格式 起始:结束，如 10:15，配合 --text 或 --new-file")
+    parser.add_argument("--whole-file", action="store_true", help="整文件替换，跳过唯一性校验，配合 --new-file")
+    parser.add_argument("--text", help="直接提供替换内容，免建 new.txt")
     args = parser.parse_args()
 
     if args.list_rules:
@@ -221,10 +318,25 @@ def main():
         do_lock(args.target)
     elif args.unlock:
         do_unlock(args.target)
+    elif args.whole_file:
+        new_text = resolve_new_text(args.text, args.new_file)
+        do_whole_file(args.target, new_text)
+    elif args.line is not None:
+        new_text = resolve_new_text(args.text, args.new_file)
+        do_line_replace(args.target, args.line, args.line, new_text)
+    elif args.range:
+        try:
+            start_s, end_s = args.range.split(":")
+            start, end = int(start_s), int(end_s)
+        except ValueError:
+            print("错误：--range 格式应为 起始:结束，如 10:15")
+            sys.exit(1)
+        new_text = resolve_new_text(args.text, args.new_file)
+        do_line_replace(args.target, start, end, new_text)
     elif args.old_file and args.new_file:
         do_replace(args.target, args.old_file, args.new_file)
     else:
-        print("错误：需要 --old-file/--new-file，或 --rollback，或 --lock/--unlock，或 --list-rules")
+        print("错误：需要 --old-file/--new-file，或 --line/--range/--whole-file，或 --rollback，或 --lock/--unlock，或 --list-rules")
         sys.exit(1)
 
 
