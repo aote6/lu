@@ -281,6 +281,48 @@ def do_whole_file(path, new_text):
         sys.exit(1)
 
 
+def do_append(path, text):
+    if not os.path.exists(path):
+        print(f"错误：目标文件不存在 {path}")
+        sys.exit(1)
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    if content and not content.endswith("\n"):
+        content += "\n"
+    if not text.endswith("\n"):
+        text += "\n"
+
+    snap_path = snapshot(path)
+    original_mode = unlock_if_needed(path)
+    try:
+        new_content = content + text
+        success = atomic_write(path, new_content)
+        if success and path.endswith(".py"):
+            import py_compile
+            try:
+                py_compile.compile(path, doraise=True)
+            except py_compile.PyCompileError as e:
+                print(f"语法校验失败，自动回滚: {e}")
+                original_mode2 = unlock_if_needed(path)
+                try:
+                    with open(snap_path, "r", encoding="utf-8") as f:
+                        snap_content = f.read()
+                    atomic_write(path, snap_content)
+                finally:
+                    relock(path, original_mode2)
+                op_log.log_op("append", path, "failed", detail=f"语法校验失败，已自动回滚: {e}")
+                sys.exit(1)
+    finally:
+        relock(path, original_mode)
+
+    if success:
+        print(f"追加成功。快照: {snap_path}")
+        op_log.log_op("append", path, "success", detail=f"快照：{snap_path}")
+    else:
+        op_log.log_op("append", path, "failed", detail="原子写入失败")
+        sys.exit(1)
+
+
 def do_lock(path):
     os.chmod(path, 0o444)
     print(f"已锁定（只读）: {path}")
@@ -315,6 +357,7 @@ def main():
     parser.add_argument("--range", help="替换行号范围，格式 起始:结束，如 10:15，配合 --text 或 --new-file")
     parser.add_argument("--whole-file", action="store_true", help="整文件替换，跳过唯一性校验，配合 --new-file")
     parser.add_argument("--text", help="直接提供替换内容，免建 new.txt")
+    parser.add_argument("--append", action="store_true", help="追加内容到文件末尾，配合 --text 或 --new-file")
     args = parser.parse_args()
 
     if args.list_rules:
@@ -325,6 +368,9 @@ def main():
         do_lock(args.target)
     elif args.unlock:
         do_unlock(args.target)
+    elif args.append:
+        new_text = resolve_new_text(args.text, args.new_file)
+        do_append(args.target, new_text)
     elif args.whole_file:
         new_text = resolve_new_text(args.text, args.new_file)
         do_whole_file(args.target, new_text)
