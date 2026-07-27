@@ -86,3 +86,21 @@
 ## 项目路径
 
 `~/lu`，与 `~/unbounded`、`~/lingti`、`~/zhiwang` 同级
+
+
+## 2026-07-27 变更：NFKC归一化 + 回滚bug修复
+
+### 新增：全角字符自动修正（NFKC归一化重试）
+三处写入操作（line_replace / whole_file / append）的语法校验失败处理中，新增NFKC归一化重试逻辑：
+- 触发条件：.py文件 + 语法校验失败 + 错误信息含"invalid character"或"unicode"
+- 执行流程：NFKC归一化 -> 重新写入 -> 重新校验 -> 通过则自动修正，失败则回滚到快照
+- 日志标记：归一化成功/失败均在operations.jsonl中记录
+- 已知代价：.py文件中文注释全角标点会被一同转半角。触发时才生效，非无条件全量转换。此代价已明确接受。
+- 测试状态：line_replace / whole_file / append 三条路径均已用真实全角字符case触发验证通过。
+
+### 修复：do_line_replace回滚失效（严重bug）
+do_line_replace的except py_compile.PyCompileError分支中，非NFKC路径（普通语法错误）只打印了"自动回滚"消息，但既未实际恢复到快照，也未调用sys.exit退出——控制流继续落到后续的if success判断，导致日志记录"写入成功"而文件实际处于损坏状态。
+修复：补全回滚动作（atomic_write恢复快照）+ op_log.log_op记录失败 + sys.exit(1)，与do_whole_file/do_append的异常处理行为一致。已用纯缩进错误case验证通过。
+
+### 验证工具改进
+构造patch内容改用Python脚本写文件（python3 << "PYEOF" + with open()），彻底绕过heredoc粘贴。此前在构造normalize_patch.txt时再次发生heredoc截断/错位，被ast.parse预检查拦截。根因一（PTY/heredoc粘贴丢字符）仍未解决，仅靠下游校验兜底。
