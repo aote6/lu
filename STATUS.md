@@ -136,3 +136,12 @@ do_line_replace的except py_compile.PyCompileError分支中，非NFKC路径（�
 ### 锚点空白容错
 
 内新增NFKC+剥离水平空白的容错匹配，容忍终端粘贴引入的全角字符和空格差异（如可正确匹配）。仍保持精确匹配不变。
+
+## 根因一（PTY粘贴丢字符）结论
+
+`termux-clipboard-get`方案搁置——需要额外安装Termux:API APK，引入外部依赖。经过多方案评估（raw模式/HTTP/共享文件/输入法限速），当前策略：
+
+- **短内容**：继续用`--text`或heredoc，NFKC归一化和`ast.parse`预检查兜底
+- **长内容（>100行）**：必须走`--new-file`，AI先将内容写入文件（如`~/storage/downloads/patch.txt`），lu再读文件写入目标
+- 输入法限速粘贴是长期方向，但不属于lu的范畴，在T9输入法项目中单独考虑
+- lu本身不再为PTY粘贴问题增加任何新代码
