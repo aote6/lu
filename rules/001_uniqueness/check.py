@@ -37,6 +37,9 @@ def main():
         sys.exit(2)
 
     print("唯一性校验：通过")
+    idx = content.find(old_text)
+    line_no = content.count("\n", 0, idx) + 1
+    print(f"位置：offset={idx} line={line_no}")
     sys.exit(0)
 
 

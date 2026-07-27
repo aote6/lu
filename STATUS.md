@@ -104,3 +104,27 @@ do_line_replace的except py_compile.PyCompileError分支中，非NFKC路径（�
 
 ### 验证工具改进
 构造patch内容改用Python脚本写文件（python3 << "PYEOF" + with open()），彻底绕过heredoc粘贴。此前在构造normalize_patch.txt时再次发生heredoc截断/错位，被ast.parse预检查拦截。根因一（PTY/heredoc粘贴丢字符）仍未解决，仅靠下游校验兜底。
+
+## 2026-07-27 变更：锚点定位替代手动行号
+
+### 新增：--anchor-line / --anchor-before / --anchor-after
+
+`--line`和`--range`依赖手动传入行号，每次写入后行号偏移，下一次patch前必须重新grep确认——这是结构性的高频摩擦。新增三个锚点参数，用内容定位替代行号定位：
+
+- `--anchor-line "锚点文本"`：替代`--line`，在目标文件中搜索锚点文本（必须唯一），自动计算行号后替换
+- `--anchor-before "锚点A"` + `--anchor-after "锚点B"`：替代`--range`，两个锚点各自定位后作为起止行
+
+**实现**：
+- 复用`rules/001_uniqueness/check.py`的唯一性判断，不另起一套逻辑
+- `check.py`成功态新增一行位置信息（`位置：offset=X line=N`），不改动exit code和原有输出，`run_rules`不受影响
+- 锚点定位不进`run_rules`规则链（职责不同：规则链是写入前拦截，锚点是写入前定位），单独调用`check.py`并解析位置行
+- 找不到/不唯一时，直接透传`check.py`的原有报错，两处唯一性判断行为完全一致
+
+**测试状态**：
+- 单锚点定位：`--anchor-line`与`grep -n`结果一致
+- 连续patch不更新行号：第一次patch改变行号后，第二次直接用锚点定位，自动找到正确的新行号
+- 锚点不唯一：报错`原文出现 N 次，不唯一`，打印所有匹配位置上下文
+
+### check.py变更
+
+唯一性校验成功时，除原有"唯一性校验：通过"外，新增一行`位置：offset=X line=N`，供锚点定位解析。exit code和原有输出不变。

@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import time
+import tempfile
 import fcntl
 import op_log
 
@@ -198,6 +199,42 @@ def resolve_new_text(text_arg, new_file_arg):
     print("错误：需要提供 --text 或 --new-file")
     sys.exit(1)
 
+
+def resolve_anchor_line(target, anchor_text):
+    """用锚点文本在target里重新定位行号，找不到或不唯一直接退出。"""
+    old_path = new_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".anchor_old",
+                                           delete=False, encoding="utf-8") as f:
+            f.write(anchor_text)
+            old_path = f.name
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".anchor_new",
+                                           delete=False, encoding="utf-8") as f:
+            new_path = f.name
+        entry = os.path.join(RULES_DIR, "001_uniqueness", "check.py")
+        result = subprocess.run(
+            ["python3", entry, "--target", target, "--old", old_path, "--new", new_path],
+            capture_output=True, text=True
+        )
+        print(result.stdout.strip())
+        if result.returncode != 0:
+            if result.stderr.strip():
+                print(result.stderr.strip())
+            sys.exit(1)
+        line_no = None
+        for line in result.stdout.splitlines():
+            if line.startswith("位置："):
+                for part in line.split():
+                    if part.startswith("line="):
+                        line_no = int(part.split("=")[1])
+        if line_no is None:
+            print("错误：锚点定位失败，无法从校验输出解析行号")
+            sys.exit(1)
+        return line_no
+    finally:
+        for p in (old_path, new_path):
+            if p and os.path.exists(p):
+                os.unlink(p)
 def do_line_replace(path, start, end, new_text):
     if not os.path.exists(path):
         print(f"错误：目标文件不存在 {path}")
@@ -450,6 +487,9 @@ def main():
     parser.add_argument("--list-rules", action="store_true")
     parser.add_argument("--line", type=int, help="替换指定行号，配合 --text 或 --new-file")
     parser.add_argument("--range", help="替换行号范围，格式 起始:结束，如 10:15，配合 --text 或 --new-file")
+    parser.add_argument("--anchor-line", help="用锚点文本定位单行，自动重新计算行号，替代 --line")
+    parser.add_argument("--anchor-before", help="用锚点文本定位替换范围起始行（含），需配合 --anchor-after")
+    parser.add_argument("--anchor-after", help="用锚点文本定位替换范围结束行（含），需配合 --anchor-before")
     parser.add_argument("--whole-file", action="store_true", help="整文件替换，跳过唯一性校验，配合 --new-file")
     parser.add_argument("--text", help="直接提供替换内容，免建 new.txt")
     parser.add_argument("--append", action="store_true", help="追加内容到文件末尾，配合 --text 或 --new-file")
@@ -469,6 +509,21 @@ def main():
     elif args.whole_file:
         new_text = resolve_new_text(args.text, args.new_file)
         do_whole_file(args.target, new_text)
+    elif args.anchor_line:
+        line_no = resolve_anchor_line(args.target, args.anchor_line)
+        new_text = resolve_new_text(args.text, args.new_file)
+        do_line_replace(args.target, line_no, line_no, new_text)
+    elif args.anchor_before and args.anchor_after:
+        start = resolve_anchor_line(args.target, args.anchor_before)
+        end = resolve_anchor_line(args.target, args.anchor_after)
+        if end < start:
+            print(f"错误：--anchor-after 定位到的行({end})早于 --anchor-before 定位到的行({start})")
+            sys.exit(1)
+        new_text = resolve_new_text(args.text, args.new_file)
+        do_line_replace(args.target, start, end, new_text)
+    elif args.anchor_before or args.anchor_after:
+        print("错误：--anchor-before 和 --anchor-after 必须成对使用")
+        sys.exit(1)
     elif args.line is not None:
         new_text = resolve_new_text(args.text, args.new_file)
         do_line_replace(args.target, args.line, args.line, new_text)
