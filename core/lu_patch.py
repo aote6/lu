@@ -226,8 +226,41 @@ def do_line_replace(path, start, end, new_text):
         try:
             py_compile.compile(path, doraise=True)
         except py_compile.PyCompileError as e:
+            err_msg = str(e)
+            # 仅当错误与全角/非ASCII字符相关时才尝试NFKC归一化
+            if ("invalid character" in err_msg or "unicode" in err_msg.lower()) and path.endswith(".py"):
+                import unicodedata
+                normalized = unicodedata.normalize("NFKC", new_content)
+                if normalized != new_content:
+                    # 归一化后的内容重新做原子写
+                    original_mode_norm = unlock_if_needed(path)
+                    try:
+                        norm_success = atomic_write(path, normalized)
+                    finally:
+                        relock(path, original_mode_norm)
+                    if norm_success:
+                        # 再次校验
+                        try:
+                            py_compile.compile(path, doraise=True)
+                            print("NFKC归一化后语法校验通过，已自动修正全角字符")
+                            op_log.log_op("line_replace", path, "success",
+                                           detail=f"行{start}-{end}，NFKC自动归一化修正全角字符，快照：{snap_path}")
+                            sys.exit(0)
+                        except py_compile.PyCompileError as e2:
+                            print(f"NFKC归一化后仍语法校验失败: {e2}")
+                            op_log.log_op("line_replace", path, "failed",
+                                           detail=f"行{start}-{end}，NFKC归一化后仍校验失败: {e2}")
+                            # 恢复到快照
+                            if snap_path and os.path.exists(snap_path):
+                                original_mode2 = unlock_if_needed(path)
+                                try:
+                                    with open(snap_path, "r", encoding="utf-8") as f:
+                                        snap_content = f.read()
+                                    atomic_write(path, snap_content)
+                                finally:
+                                    relock(path, original_mode2)
+                            sys.exit(1)
             print(f"语法校验失败，自动回滚: {e}")
-            # 恢复到快照
             if snap_path and os.path.exists(snap_path):
                 original_mode2 = unlock_if_needed(path)
                 try:
@@ -262,6 +295,36 @@ def do_whole_file(path, new_text):
         try:
             py_compile.compile(path, doraise=True)
         except py_compile.PyCompileError as e:
+            err_msg = str(e)
+            if ("invalid character" in err_msg or "unicode" in err_msg.lower()) and path.endswith(".py"):
+                import unicodedata
+                normalized = unicodedata.normalize("NFKC", new_text)
+                if normalized != new_text:
+                    orig_mode = unlock_if_needed(path)
+                    try:
+                        norm_ok = atomic_write(path, normalized)
+                    finally:
+                        relock(path, orig_mode)
+                    if norm_ok:
+                        try:
+                            py_compile.compile(path, doraise=True)
+                            print("NFKC归一化后语法校验通过，已自动修正全角字符")
+                            op_log.log_op("whole_file", path, "success",
+                                          detail=f"NFKC自动归一化修正全角字符，快照：{snap_path}")
+                            sys.exit(0)
+                        except py_compile.PyCompileError as e2:
+                            print(f"NFKC归一化后仍语法校验失败: {e2}")
+                            op_log.log_op("whole_file", path, "failed",
+                                          detail=f"NFKC归一化后仍校验失败: {e2}")
+                            if snap_path and os.path.exists(snap_path):
+                                orig_mode2 = unlock_if_needed(path)
+                                try:
+                                    with open(snap_path, "r", encoding="utf-8") as f:
+                                        snap_content = f.read()
+                                    atomic_write(path, snap_content)
+                                finally:
+                                    relock(path, orig_mode2)
+                            sys.exit(1)
             print(f"语法校验失败，自动回滚: {e}")
             if snap_path and os.path.exists(snap_path):
                 original_mode2 = unlock_if_needed(path)
@@ -272,6 +335,7 @@ def do_whole_file(path, new_text):
                 finally:
                     relock(path, original_mode2)
             op_log.log_op("whole_file", path, "failed", detail=f"语法校验失败，已自动回滚: {e}")
+            sys.exit(1)
             sys.exit(1)
     if success:
         print(f"整文件替换成功（已跳过唯一性校验）。快照: {snap_path}")
@@ -302,6 +366,37 @@ def do_append(path, text):
             try:
                 py_compile.compile(path, doraise=True)
             except py_compile.PyCompileError as e:
+                err_msg = str(e)
+                # 仅当错误与全角/非ASCII字符相关时才尝试NFKC归一化
+                if ("invalid character" in err_msg or "unicode" in err_msg.lower()) and path.endswith(".py"):
+                    import unicodedata
+                    normalized = unicodedata.normalize("NFKC", new_content)
+                    if normalized != new_content:
+                        orig_mode = unlock_if_needed(path)
+                        try:
+                            norm_ok = atomic_write(path, normalized)
+                        finally:
+                            relock(path, orig_mode)
+                        if norm_ok:
+                            try:
+                                py_compile.compile(path, doraise=True)
+                                print("NFKC归一化后语法校验通过，已自动修正全角字符")
+                                op_log.log_op("append", path, "success",
+                                              detail=f"NFKC自动归一化修正全角字符，快照：{snap_path}")
+                                sys.exit(0)
+                            except py_compile.PyCompileError as e2:
+                                print(f"NFKC归一化后仍语法校验失败: {e2}")
+                                op_log.log_op("append", path, "failed",
+                                              detail=f"NFKC归一化后仍校验失败: {e2}")
+                                if snap_path and os.path.exists(snap_path):
+                                    orig_mode2 = unlock_if_needed(path)
+                                    try:
+                                        with open(snap_path, "r", encoding="utf-8") as f:
+                                            snap_content = f.read()
+                                        atomic_write(path, snap_content)
+                                    finally:
+                                        relock(path, orig_mode2)
+                                sys.exit(1)
                 print(f"语法校验失败，自动回滚: {e}")
                 original_mode2 = unlock_if_needed(path)
                 try:
