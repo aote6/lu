@@ -1,4 +1,4 @@
-test
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 lu_patch.py -- 炉的写入编排器
@@ -201,40 +201,41 @@ def resolve_new_text(text_arg, new_file_arg):
 
 
 def resolve_anchor_line(target, anchor_text):
-    """用锚点文本在target里重新定位行号，找不到或不唯一直接退出。"""
-    old_path = new_path = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".anchor_old",
-                                           delete=False, encoding="utf-8") as f:
-            f.write(anchor_text)
-            old_path = f.name
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".anchor_new",
-                                           delete=False, encoding="utf-8") as f:
-            new_path = f.name
-        entry = os.path.join(RULES_DIR, "001_uniqueness", "check.py")
-        result = subprocess.run(
-            ["python3", entry, "--target", target, "--old", old_path, "--new", new_path],
-            capture_output=True, text=True
-        )
-        print(result.stdout.strip())
-        if result.returncode != 0:
-            if result.stderr.strip():
-                print(result.stderr.strip())
-            sys.exit(1)
-        line_no = None
-        for line in result.stdout.splitlines():
-            if line.startswith("位置："):
-                for part in line.split():
-                    if part.startswith("line="):
-                        line_no = int(part.split("=")[1])
-        if line_no is None:
-            print("错误：锚点定位失败，无法从校验输出解析行号")
-            sys.exit(1)
-        return line_no
-    finally:
-        for p in (old_path, new_path):
-            if p and os.path.exists(p):
-                os.unlink(p)
+    """用锚点文本在target里重新定位行号，找不到或不唯一直接退出。
+    为抵抗终端粘贴带来的全角/半角和空格差异，采用剥离水平空白的容错匹配。"""
+    import unicodedata
+    import re
+    import sys
+
+    def normalize_for_search(text):
+        text = unicodedata.normalize("NFKC", text)
+        return re.sub(r'[^\S\n]+', '', text).strip()
+
+    search_anchor = normalize_for_search(anchor_text)
+    anchor_first_line = search_anchor.split('\n')[0]
+
+    with open(target, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    matched_line_no = None
+    match_count = 0
+
+    for i, line in enumerate(lines):
+        clean_line = normalize_for_search(line)
+        if anchor_first_line and anchor_first_line in clean_line:
+            match_count += 1
+            matched_line_no = i + 1
+
+    if match_count == 0:
+        print("错误：锚点定位失败，未在目标文件中找到匹配行（已忽略空格与全角差异）")
+        sys.exit(1)
+    elif match_count > 1:
+        print(f"错误：锚点定位失败，特征行出现 {match_count} 次，不唯一")
+        sys.exit(1)
+
+    print(f"锚点定位成功：第 {matched_line_no} 行")
+    return matched_line_no
+
 def do_line_replace(path, start, end, new_text):
     if not os.path.exists(path):
         print(f"错误：目标文件不存在 {path}")
