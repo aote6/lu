@@ -182,21 +182,26 @@ def do_rollback(path):
     op_log.log_op("rollback", path, "success", detail=f"来自快照：{snap}")
 
 
-def resolve_new_text(text_arg, new_file_arg):
+def resolve_new_text(text_arg, new_file_arg, text_file_arg=None):
+    if text_file_arg:
+        with open(text_file_arg, 'r', encoding='utf-8') as f:
+            return f.read()
     if text_arg is not None:
         if "\n" in text_arg:
             print("拒绝：--text 内容包含换行符，多行内容在 shell 里极易被截断/错位。")
-            print("请改用 --new-file：先把内容写入一个临时文件，再用 --new-file 那个文件路径。")
+            print("请改用 --text-file：先把内容写入一个临时文件，再用 --text-file 指定该文件路径，例如：")
+            print("  python3 lu_patch.py --anchor-line \"锚点文本\" --text-file /tmp/patch.txt target.py")
             sys.exit(3)
         if "\x27" in text_arg and "\x22" in text_arg:
             print("拒绝：--text 内容同时包含单引号和双引号，shell 转义在这种情况下不可靠。")
-            print("请改用 --new-file：先把内容写入一个临时文件，再用 --new-file 那个文件路径。")
+            print("请改用 --text-file：先把内容写入一个临时文件，再用 --text-file 指定该文件路径，例如：")
+            print("  python3 lu_patch.py --anchor-line \"锚点文本\" --text-file /tmp/patch.txt target.py")
             sys.exit(3)
         return text_arg
     if new_file_arg:
-        with open(new_file_arg, "r", encoding="utf-8") as f:
+        with open(new_file_arg, 'r', encoding='utf-8') as f:
             return f.read()
-    print("错误：需要提供 --text 或 --new-file")
+    print("错误：需要提供 --text、--text-file 或 --new-file")
     sys.exit(1)
 
 
@@ -248,6 +253,8 @@ def do_line_replace(path, start, end, new_text):
 
     print(f"[将被替换的行 {start}-{end}]")
     print("".join(lines[start-1:end]).rstrip("\n"))
+    print("[repr 形式，用于核对不可见字符/转义序列]")
+    print(repr("".join(lines[start-1:end])))
 
     if not new_text.endswith("\n"):
         new_text += "\n"
@@ -488,6 +495,7 @@ def main():
     parser.add_argument("--list-rules", action="store_true")
     parser.add_argument("--line", type=int, help="替换指定行号，配合 --text 或 --new-file")
     parser.add_argument("--range", help="替换行号范围，格式 起始:结束，如 10:15，配合 --text 或 --new-file")
+    parser.add_argument("--text-file", help="从文件读取替换内容，替代 --text 以绕开 shell 转义问题")
     parser.add_argument("--anchor-line", help="用锚点文本定位单行，自动重新计算行号，替代 --line")
     parser.add_argument("--anchor-before", help="用锚点文本定位替换范围起始行（含），需配合 --anchor-after")
     parser.add_argument("--anchor-after", help="用锚点文本定位替换范围结束行（含），需配合 --anchor-before")
@@ -505,14 +513,14 @@ def main():
     elif args.unlock:
         do_unlock(args.target)
     elif args.append:
-        new_text = resolve_new_text(args.text, args.new_file)
+        new_text = resolve_new_text(args.text, args.new_file, args.text_file)
         do_append(args.target, new_text)
     elif args.whole_file:
-        new_text = resolve_new_text(args.text, args.new_file)
+        new_text = resolve_new_text(args.text, args.new_file, args.text_file)
         do_whole_file(args.target, new_text)
     elif args.anchor_line:
         line_no = resolve_anchor_line(args.target, args.anchor_line)
-        new_text = resolve_new_text(args.text, args.new_file)
+        new_text = resolve_new_text(args.text, args.new_file, args.text_file)
         do_line_replace(args.target, line_no, line_no, new_text)
     elif args.anchor_before and args.anchor_after:
         start = resolve_anchor_line(args.target, args.anchor_before)
@@ -520,14 +528,14 @@ def main():
         if end < start:
             print(f"错误：--anchor-after 定位到的行({end})早于 --anchor-before 定位到的行({start})")
             sys.exit(1)
-        new_text = resolve_new_text(args.text, args.new_file)
+        new_text = resolve_new_text(args.text, args.new_file, args.text_file)
         do_line_replace(args.target, start, end, new_text)
     elif args.anchor_before or args.anchor_after:
         print("错误：--anchor-before 和 --anchor-after 必须成对使用")
         sys.exit(1)
     elif args.line is not None:
         print("提示：使用手动行号(--line)。若该行号不是本次刚确认的，可能因此前修改已偏移，建议改用 --anchor-line 定位。")
-        new_text = resolve_new_text(args.text, args.new_file)
+        new_text = resolve_new_text(args.text, args.new_file, args.text_file)
         do_line_replace(args.target, args.line, args.line, new_text)
     elif args.range:
         print("提示：使用手动行号(--range)。若该范围不是本次刚确认的，可能因此前修改已偏移，建议改用 --anchor-before/--anchor-after 定位。")
@@ -537,7 +545,7 @@ def main():
         except ValueError:
             print("错误：--range 格式应为 起始:结束，如 10:15")
             sys.exit(1)
-        new_text = resolve_new_text(args.text, args.new_file)
+        new_text = resolve_new_text(args.text, args.new_file, args.text_file)
         do_line_replace(args.target, start, end, new_text)
     elif args.old_file and args.new_file:
         do_replace(args.target, args.old_file, args.new_file)
