@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+test
 # -*- coding: utf-8 -*-
 """
 lu_patch.py -- 炉的写入编排器
@@ -477,7 +477,7 @@ def do_list_rules():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="lu_patch - 炉的写入编排器")
+    parser = argparse.ArgumentParser(description="炉(lu)：安全文件写入编排工具。推荐使用 --anchor-line/--anchor-before/--anchor-after 定位，避免 --line/--range 手动行号因修改而失效的问题。")
     parser.add_argument("target", nargs="?")
     parser.add_argument("--old-file")
     parser.add_argument("--new-file")
@@ -525,9 +525,11 @@ def main():
         print("错误：--anchor-before 和 --anchor-after 必须成对使用")
         sys.exit(1)
     elif args.line is not None:
+        print("提示：使用手动行号(--line)。若该行号不是本次刚确认的，可能因此前修改已偏移，建议改用 --anchor-line 定位。")
         new_text = resolve_new_text(args.text, args.new_file)
         do_line_replace(args.target, args.line, args.line, new_text)
     elif args.range:
+        print("提示：使用手动行号(--range)。若该范围不是本次刚确认的，可能因此前修改已偏移，建议改用 --anchor-before/--anchor-after 定位。")
         try:
             start_s, end_s = args.range.split(":")
             start, end = int(start_s), int(end_s)

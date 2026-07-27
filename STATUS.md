@@ -128,3 +128,7 @@ do_line_replace的except py_compile.PyCompileError分支中，非NFKC路径（�
 ### check.py变更
 
 唯一性校验成功时，除原有"唯一性校验：通过"外，新增一行`位置：offset=X line=N`，供锚点定位解析。exit code和原有输出不变。
+
+### 工具自提示
+
+/被调用时自动打印提示，建议改用锚点定位。总纲同步推荐anchor。任何使用者首次接触工具即被告知，不依赖外部解释。
