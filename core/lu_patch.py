@@ -52,12 +52,18 @@ def run_rules(target, old_file, new_file):
     依次运行所有规则节点（各自独立子进程）。
     任意一条不通过就立即停止，返回失败的规则名和输出。
     全部通过返回 True。
+    规则入口文件缺失视为规则系统损坏，直接拒绝（不允许 silent allow）。
     """
-    for rule in load_rules():
+    rules = load_rules()
+    if not rules:
+        # 无规则时允许通过，但明确打印，避免误以为 Constitution 生效
+        print("[规则] 当前无已注册规则节点，默认通过")
+        return True, None, None
+    for rule in rules:
         entry = os.path.join(rule["_dir"], rule.get("entry", "check.py"))
         if not os.path.exists(entry):
-            print(f"警告：规则 {rule.get('name')} 的入口文件不存在，跳过")
-            continue
+            print(f"错误：规则 {rule.get('name')} 的入口文件不存在：{entry}")
+            return False, rule.get("name", rule["_dir"]), f"entry missing: {entry}"
         result = subprocess.run(
             ["python3", entry, "--target", target, "--old", old_file, "--new", new_file],
             capture_output=True, text=True
@@ -131,16 +137,23 @@ def atomic_write(path, new_content):
 
 # ==================== 对外命令 ====================
 
-def do_replace(path, old_file, new_file):
+def do_replace(path, old_file, new_file, check_only=False):
     if not os.path.exists(path):
         print(f"错误：目标文件不存在 {path}")
         sys.exit(1)
 
-    ok, failed_rule, _ = run_rules(path, old_file, new_file)
+    ok, failed_rule, evidence = run_rules(path, old_file, new_file)
     if not ok:
         print(f"拒绝写入：规则「{failed_rule}」未通过")
         op_log.log_op("replace", path, "failed", detail=f"规则未通过：{failed_rule}")
+        if check_only:
+            print(json.dumps({"decision": "DENY", "reason": f"rule failed: {failed_rule}", "evidence": evidence}, ensure_ascii=False))
         sys.exit(2)
+
+    if check_only:
+        print(json.dumps({"decision": "ALLOW", "reason": "all rules passed", "evidence": None}, ensure_ascii=False))
+        print("检查通过（--check，未写入）")
+        sys.exit(0)
 
     with open(old_file, "r", encoding="utf-8") as f:
         old_text = f.read()
@@ -241,7 +254,7 @@ def resolve_anchor_line(target, anchor_text):
     print(f"锚点定位成功：第 {matched_line_no} 行")
     return matched_line_no
 
-def do_line_replace(path, start, end, new_text):
+def do_line_replace(path, start, end, new_text, check_only=False):
     if not os.path.exists(path):
         print(f"错误：目标文件不存在 {path}")
         sys.exit(1)
@@ -251,13 +264,41 @@ def do_line_replace(path, start, end, new_text):
         print(f"错误：行号范围不合法（文件共 {len(lines)} 行，请求 {start}-{end}）")
         sys.exit(1)
 
+    old_block = "".join(lines[start-1:end])
     print(f"[将被替换的行 {start}-{end}]")
-    print("".join(lines[start-1:end]).rstrip("\n"))
+    print(old_block.rstrip("\n"))
     print("[repr 形式，用于核对不可见字符/转义序列]")
-    print(repr("".join(lines[start-1:end])))
+    print(repr(old_block))
 
     if not new_text.endswith("\n"):
         new_text += "\n"
+
+    # 构造临时 old/new，走统一规则引擎（唯一性等），禁止绕过
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".old") as of:
+        of.write(old_block)
+        old_tmp = of.name
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".new") as nf:
+        nf.write(new_text)
+        new_tmp = nf.name
+    try:
+        ok, failed_rule, evidence = run_rules(path, old_tmp, new_tmp)
+        if not ok:
+            print(f"拒绝写入：规则「{failed_rule}」未通过")
+            op_log.log_op("line_replace", path, "failed", detail=f"规则未通过：{failed_rule}")
+            if check_only:
+                print(json.dumps({"decision": "DENY", "reason": f"rule failed: {failed_rule}", "evidence": evidence}, ensure_ascii=False))
+            sys.exit(2)
+    finally:
+        for p in (old_tmp, new_tmp):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    if check_only:
+        print(json.dumps({"decision": "ALLOW", "reason": "all rules passed", "evidence": None}, ensure_ascii=False))
+        print("检查通过（--check，未写入）")
+        sys.exit(0)
 
     snap_path = snapshot(path)
     original_mode = unlock_if_needed(path)
@@ -324,10 +365,40 @@ def do_line_replace(path, start, end, new_text):
         sys.exit(1)
 
 
-def do_whole_file(path, new_text):
+def do_whole_file(path, new_text, check_only=False):
     if not os.path.exists(path):
         print(f"错误：目标文件不存在 {path}")
         sys.exit(1)
+
+    with open(path, "r", encoding="utf-8") as f:
+        old_content = f.read()
+
+    # 整文件替换也走统一规则引擎（old=全文），禁止旁路
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".old") as of:
+        of.write(old_content)
+        old_tmp = of.name
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".new") as nf:
+        nf.write(new_text)
+        new_tmp = nf.name
+    try:
+        ok, failed_rule, evidence = run_rules(path, old_tmp, new_tmp)
+        if not ok:
+            print(f"拒绝写入：规则「{failed_rule}」未通过")
+            op_log.log_op("whole_file", path, "failed", detail=f"规则未通过：{failed_rule}")
+            if check_only:
+                print(json.dumps({"decision": "DENY", "reason": f"rule failed: {failed_rule}", "evidence": evidence}, ensure_ascii=False))
+            sys.exit(2)
+    finally:
+        for p in (old_tmp, new_tmp):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    if check_only:
+        print(json.dumps({"decision": "ALLOW", "reason": "all rules passed", "evidence": None}, ensure_ascii=False))
+        print("检查通过（--check，未写入）")
+        sys.exit(0)
 
     snap_path = snapshot(path)
     original_mode = unlock_if_needed(path)
@@ -381,10 +452,9 @@ def do_whole_file(path, new_text):
                     relock(path, original_mode2)
             op_log.log_op("whole_file", path, "failed", detail=f"语法校验失败，已自动回滚: {e}")
             sys.exit(1)
-            sys.exit(1)
     if success:
-        print(f"整文件替换成功（已跳过唯一性校验）。快照: {snap_path}")
-        op_log.log_op("whole_file", path, "success", detail=f"跳过规则校验，快照：{snap_path}")
+        print(f"整文件替换成功。快照: {snap_path}")
+        op_log.log_op("whole_file", path, "success", detail=f"规则已通过，快照：{snap_path}")
     else:
         op_log.log_op("whole_file", path, "failed", detail="原子写入失败")
         sys.exit(1)
@@ -499,29 +569,45 @@ def main():
     parser.add_argument("--anchor-line", help="用锚点文本定位单行，自动重新计算行号，替代 --line")
     parser.add_argument("--anchor-before", help="用锚点文本定位替换范围起始行（含），需配合 --anchor-after")
     parser.add_argument("--anchor-after", help="用锚点文本定位替换范围结束行（含），需配合 --anchor-before")
-    parser.add_argument("--whole-file", action="store_true", help="整文件替换，跳过唯一性校验，配合 --new-file")
+    parser.add_argument("--whole-file", action="store_true", help="整文件替换（仍经 Constitution 规则），配合 --new-file 或 --text/--text-file")
     parser.add_argument("--text", help="直接提供替换内容，免建 new.txt")
-    parser.add_argument("--append", action="store_true", help="追加内容到文件末尾，配合 --text 或 --new-file")
+    parser.add_argument("--append", action="store_true", help="追加内容到文件末尾，配合 --text 或 --new-file（不经过唯一性规则）")
+    parser.add_argument("--check", action="store_true",
+                        help="仅运行 Constitution 规则检查，不写入。输出 decision JSON，exit 0=ALLOW / 2=DENY")
     args = parser.parse_args()
+
+    check_only = bool(args.check)
 
     if args.list_rules:
         do_list_rules()
     elif args.rollback:
+        if check_only:
+            print("错误：--check 不能与 --rollback 同时使用")
+            sys.exit(1)
         do_rollback(args.target)
     elif args.lock:
+        if check_only:
+            print("错误：--check 不能与 --lock 同时使用")
+            sys.exit(1)
         do_lock(args.target)
     elif args.unlock:
+        if check_only:
+            print("错误：--check 不能与 --unlock 同时使用")
+            sys.exit(1)
         do_unlock(args.target)
     elif args.append:
+        if check_only:
+            print("错误：--append 路径当前无适用的 Constitution 规则（无 old 语义），--check 不适用")
+            sys.exit(1)
         new_text = resolve_new_text(args.text, args.new_file, args.text_file)
         do_append(args.target, new_text)
     elif args.whole_file:
         new_text = resolve_new_text(args.text, args.new_file, args.text_file)
-        do_whole_file(args.target, new_text)
+        do_whole_file(args.target, new_text, check_only=check_only)
     elif args.anchor_line:
         line_no = resolve_anchor_line(args.target, args.anchor_line)
         new_text = resolve_new_text(args.text, args.new_file, args.text_file)
-        do_line_replace(args.target, line_no, line_no, new_text)
+        do_line_replace(args.target, line_no, line_no, new_text, check_only=check_only)
     elif args.anchor_before and args.anchor_after:
         start = resolve_anchor_line(args.target, args.anchor_before)
         end = resolve_anchor_line(args.target, args.anchor_after)
@@ -529,14 +615,14 @@ def main():
             print(f"错误：--anchor-after 定位到的行({end})早于 --anchor-before 定位到的行({start})")
             sys.exit(1)
         new_text = resolve_new_text(args.text, args.new_file, args.text_file)
-        do_line_replace(args.target, start, end, new_text)
+        do_line_replace(args.target, start, end, new_text, check_only=check_only)
     elif args.anchor_before or args.anchor_after:
         print("错误：--anchor-before 和 --anchor-after 必须成对使用")
         sys.exit(1)
     elif args.line is not None:
         print("提示：使用手动行号(--line)。若该行号不是本次刚确认的，可能因此前修改已偏移，建议改用 --anchor-line 定位。")
         new_text = resolve_new_text(args.text, args.new_file, args.text_file)
-        do_line_replace(args.target, args.line, args.line, new_text)
+        do_line_replace(args.target, args.line, args.line, new_text, check_only=check_only)
     elif args.range:
         print("提示：使用手动行号(--range)。若该范围不是本次刚确认的，可能因此前修改已偏移，建议改用 --anchor-before/--anchor-after 定位。")
         try:
@@ -546,9 +632,9 @@ def main():
             print("错误：--range 格式应为 起始:结束，如 10:15")
             sys.exit(1)
         new_text = resolve_new_text(args.text, args.new_file, args.text_file)
-        do_line_replace(args.target, start, end, new_text)
+        do_line_replace(args.target, start, end, new_text, check_only=check_only)
     elif args.old_file and args.new_file:
-        do_replace(args.target, args.old_file, args.new_file)
+        do_replace(args.target, args.old_file, args.new_file, check_only=check_only)
     else:
         print("错误：需要 --old-file/--new-file，或 --line/--range/--whole-file，或 --rollback，或 --lock/--unlock，或 --list-rules")
         sys.exit(1)
